@@ -247,5 +247,5 @@ python client.py --host HOST --port PORT --id CLIENT_ID --quiet
 
 ## Authors
 
-- Group Number: [YOUR_GROUP_NUMBER]
-- Members: [MEMBER_NAMES]
+- Group Number: 33
+- Members: Tanmai, Keyur, Prakarsh
