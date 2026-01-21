@@ -150,12 +150,14 @@ class ClientHandler:
     """Handles one client connection through the MITM proxy."""
     
     def __init__(self, client_conn: socket.socket, client_addr: Tuple[str, int],
-                 server_host: str, server_port: int, message_store: MessageStore):
+                 server_host: str, server_port: int, message_store: MessageStore,
+                 user_interaction_lock: threading.Lock):
         self.client_conn = client_conn
         self.client_addr = client_addr
         self.server_host = server_host
         self.server_port = server_port
         self.message_store = message_store
+        self.user_interaction_lock = user_interaction_lock
         self.server_conn: Optional[socket.socket] = None
         self.client_id: Optional[int] = None
         self.running = False
@@ -233,78 +235,80 @@ class ClientHandler:
     def prompt_action(self, direction: str, data: bytes) -> Optional[bytes]:
         """
         Prompt attacker for action on this message.
-        
+
         Returns: data to forward, or None to drop
         """
-        summary = message_summary(data)
-        
-        # Extract client ID from message
-        try:
-            _, client_id, round_num, dir_enum, _ = parse_header(data)
-            self.client_id = client_id
-        except:
-            client_id = self.client_id or "?"
-            round_num = "?"
-        
-        print(f"\n{'='*60}")
-        print(f"[INTERCEPTED] {direction}")
-        print(f"{'='*60}")
-        print(f"    {summary}")
-        print(f"    Raw ({len(data)} bytes): {data[:32].hex()}...")
-        print()
-        print("    Actions:")
-        print("    [f] Forward unchanged")
-        print("    [d] Drop message")
-        print("    [m] Modify message")
-        print("    [r] Replay stored message")
-        print("    [e] Reflect back to sender")
-        print()
-        
-        while True:
-            action = input("    Action: ").strip().lower()
-            
-            if action == 'f':
-                print("    -> Forwarding")
-                self.message_store.add(direction, client_id, data)
-                return data
-            
-            elif action == 'd':
-                print("    -> DROPPED")
-                self.message_store.add(direction, client_id, data)
-                return None
-            
-            elif action == 'm':
-                modified = modify_message(data)
-                if modified != data:
-                    print("    -> Forwarding MODIFIED message")
-                else:
-                    print("    -> Forwarding unchanged")
-                self.message_store.add(direction, client_id, data)  # Store original
-                return modified
-            
-            elif action == 'r':
-                self.message_store.list_messages()
-                try:
-                    idx = int(input("    Replay message #: ").strip())
-                    replay_data = self.message_store.get(idx)
-                    if replay_data:
-                        print(f"    -> REPLAYING message #{idx}")
-                        print(f"       {message_summary(replay_data)}")
-                        self.message_store.add(direction, client_id, data)  # Store original
-                        return replay_data
+        # Acquire global lock to serialize user interactions across all handlers
+        with self.user_interaction_lock:
+            summary = message_summary(data)
+
+            # Extract client ID from message
+            try:
+                _, client_id, round_num, dir_enum, _ = parse_header(data)
+                self.client_id = client_id
+            except:
+                client_id = self.client_id or "?"
+                round_num = "?"
+
+            print(f"\n{'='*60}")
+            print(f"[INTERCEPTED] {direction}")
+            print(f"{'='*60}")
+            print(f"    {summary}")
+            print(f"    Raw ({len(data)} bytes): {data[:32].hex()}...")
+            print()
+            print("    Actions:")
+            print("    [f] Forward unchanged")
+            print("    [d] Drop message")
+            print("    [m] Modify message")
+            print("    [r] Replay stored message")
+            print("    [e] Reflect back to sender")
+            print()
+
+            while True:
+                action = input("    Action: ").strip().lower()
+
+                if action == 'f':
+                    print("    -> Forwarding")
+                    self.message_store.add(direction, client_id, data)
+                    return data
+
+                elif action == 'd':
+                    print("    -> DROPPED")
+                    self.message_store.add(direction, client_id, data)
+                    return None
+
+                elif action == 'm':
+                    modified = modify_message(data)
+                    if modified != data:
+                        print("    -> Forwarding MODIFIED message")
                     else:
-                        print("    Invalid index")
-                except ValueError:
-                    print("    Invalid input")
-            
-            elif action == 'e':
-                print("    -> REFLECTING back to sender")
-                self.message_store.add(direction, client_id, data)
-                # Return special marker - caller will handle reflection
-                return "REFLECT"
-            
-            else:
-                print("    Invalid action. Use: f/d/m/r/e")
+                        print("    -> Forwarding unchanged")
+                    self.message_store.add(direction, client_id, data)  # Store original
+                    return modified
+
+                elif action == 'r':
+                    self.message_store.list_messages()
+                    try:
+                        idx = int(input("    Replay message #: ").strip())
+                        replay_data = self.message_store.get(idx)
+                        if replay_data:
+                            print(f"    -> REPLAYING message #{idx}")
+                            print(f"       {message_summary(replay_data)}")
+                            self.message_store.add(direction, client_id, data)  # Store original
+                            return replay_data
+                        else:
+                            print("    Invalid index")
+                    except ValueError:
+                        print("    Invalid input")
+
+                elif action == 'e':
+                    print("    -> REFLECTING back to sender")
+                    self.message_store.add(direction, client_id, data)
+                    # Return special marker - caller will handle reflection
+                    return "REFLECT"
+
+                else:
+                    print("    Invalid action. Use: f/d/m/r/e")
     
     def run(self):
         """Run the MITM handler."""
@@ -376,6 +380,8 @@ class MITMAttacker:
         self.running = False
         self.message_store = MessageStore()
         self.handlers: List[ClientHandler] = []
+        # Global lock to serialize user interactions across all handlers
+        self.user_interaction_lock = threading.Lock()
     
     def log(self, msg: str):
         """Print log message."""
@@ -416,7 +422,8 @@ class MITMAttacker:
                     conn, addr,
                     self.config.server_host,
                     self.config.server_port,
-                    self.message_store
+                    self.message_store,
+                    self.user_interaction_lock
                 )
                 self.handlers.append(handler)
                 
