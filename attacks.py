@@ -14,6 +14,7 @@ For each message, the attacker can choose to:
 import socket
 import threading
 import struct
+import queue
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -34,6 +35,19 @@ class AttackerConfig:
     listen_port: int = 7000       # Clients connect here
     server_host: str = '127.0.0.1'
     server_port: int = 6000       # Forward to server here
+
+
+# ==============================================================================
+# Pending Message (for queue)
+# ==============================================================================
+
+@dataclass
+class PendingMessage:
+    """A message waiting to be processed by the attacker."""
+    direction: str              # "Client -> Server" or "Server -> Client"
+    client_id: int              # Which client this belongs to
+    data: bytes                 # Raw message bytes
+    handler: 'ClientHandler'    # Reference to handler for sending
 
 
 # ==============================================================================
@@ -150,11 +164,13 @@ class ClientHandler:
     """Handles one client connection through the MITM proxy."""
     
     def __init__(self, client_conn: socket.socket, client_addr: Tuple[str, int],
-                 server_host: str, server_port: int, message_store: MessageStore):
+                 server_host: str, server_port: int, 
+                 message_queue: queue.Queue, message_store: MessageStore):
         self.client_conn = client_conn
         self.client_addr = client_addr
         self.server_host = server_host
         self.server_port = server_port
+        self.message_queue = message_queue  # Centralized queue
         self.message_store = message_store
         self.server_conn: Optional[socket.socket] = None
         self.client_id: Optional[int] = None
@@ -179,7 +195,7 @@ class ClientHandler:
     def recv_from_client(self) -> Optional[bytes]:
         """Receive message from client."""
         try:
-            self.client_conn.settimeout(1.0)
+            self.client_conn.settimeout(0.5)
             header = b''
             while len(header) < HEADER_SIZE:
                 chunk = self.client_conn.recv(HEADER_SIZE - len(header))
@@ -187,7 +203,7 @@ class ClientHandler:
                     return None
                 header += chunk
             
-            self.client_conn.settimeout(1.0)
+            self.client_conn.settimeout(0.5)
             rest = self.client_conn.recv(4096)
             return header + rest if rest else None
         except socket.timeout:
@@ -198,7 +214,7 @@ class ClientHandler:
     def recv_from_server(self) -> Optional[bytes]:
         """Receive message from server."""
         try:
-            self.server_conn.settimeout(1.0)
+            self.server_conn.settimeout(0.5)
             header = b''
             while len(header) < HEADER_SIZE:
                 chunk = self.server_conn.recv(HEADER_SIZE - len(header))
@@ -206,7 +222,7 @@ class ClientHandler:
                     return None
                 header += chunk
             
-            self.server_conn.settimeout(1.0)
+            self.server_conn.settimeout(0.5)
             rest = self.server_conn.recv(4096)
             return header + rest if rest else None
         except socket.timeout:
@@ -230,84 +246,8 @@ class ClientHandler:
         except:
             return False
     
-    def prompt_action(self, direction: str, data: bytes) -> Optional[bytes]:
-        """
-        Prompt attacker for action on this message.
-        
-        Returns: data to forward, or None to drop
-        """
-        summary = message_summary(data)
-        
-        # Extract client ID from message
-        try:
-            _, client_id, round_num, dir_enum, _ = parse_header(data)
-            self.client_id = client_id
-        except:
-            client_id = self.client_id or "?"
-            round_num = "?"
-        
-        print(f"\n{'='*60}")
-        print(f"[INTERCEPTED] {direction}")
-        print(f"{'='*60}")
-        print(f"    {summary}")
-        print(f"    Raw ({len(data)} bytes): {data[:32].hex()}...")
-        print()
-        print("    Actions:")
-        print("    [f] Forward unchanged")
-        print("    [d] Drop message")
-        print("    [m] Modify message")
-        print("    [r] Replay stored message")
-        print("    [e] Reflect back to sender")
-        print()
-        
-        while True:
-            action = input("    Action: ").strip().lower()
-            
-            if action == 'f':
-                print("    -> Forwarding")
-                self.message_store.add(direction, client_id, data)
-                return data
-            
-            elif action == 'd':
-                print("    -> DROPPED")
-                self.message_store.add(direction, client_id, data)
-                return None
-            
-            elif action == 'm':
-                modified = modify_message(data)
-                if modified != data:
-                    print("    -> Forwarding MODIFIED message")
-                else:
-                    print("    -> Forwarding unchanged")
-                self.message_store.add(direction, client_id, data)  # Store original
-                return modified
-            
-            elif action == 'r':
-                self.message_store.list_messages()
-                try:
-                    idx = int(input("    Replay message #: ").strip())
-                    replay_data = self.message_store.get(idx)
-                    if replay_data:
-                        print(f"    -> REPLAYING message #{idx}")
-                        print(f"       {message_summary(replay_data)}")
-                        self.message_store.add(direction, client_id, data)  # Store original
-                        return replay_data
-                    else:
-                        print("    Invalid index")
-                except ValueError:
-                    print("    Invalid input")
-            
-            elif action == 'e':
-                print("    -> REFLECTING back to sender")
-                self.message_store.add(direction, client_id, data)
-                # Return special marker - caller will handle reflection
-                return "REFLECT"
-            
-            else:
-                print("    Invalid action. Use: f/d/m/r/e")
-    
     def run(self):
-        """Run the MITM handler."""
+        """Run the MITM handler - just receives and enqueues messages."""
         self.running = True
         
         # Connect to server
@@ -315,36 +255,46 @@ class ClientHandler:
             self.client_conn.close()
             return
         
-        self.log("Proxy established")
+        # self.log("Proxy established")
         
         while self.running:
             # Check for client -> server messages
             c2s_data = self.recv_from_client()
             if c2s_data:
-                result = self.prompt_action("Client -> Server", c2s_data)
+                # Extract client ID from message
+                try:
+                    _, client_id, _, _, _ = parse_header(c2s_data)
+                    self.client_id = client_id
+                except:
+                    client_id = self.client_id or 0
                 
-                if result == "REFLECT":
-                    # Reflect back to client
-                    if not self.send_to_client(c2s_data):
-                        break
-                elif result is not None:
-                    if not self.send_to_server(result):
-                        break
-                # If None (dropped), just continue
+                # Enqueue for processing
+                pending = PendingMessage(
+                    direction="Client -> Server",
+                    client_id=client_id,
+                    data=c2s_data,
+                    handler=self
+                )
+                self.message_queue.put(pending)
             
             # Check for server -> client messages
             s2c_data = self.recv_from_server()
             if s2c_data:
-                result = self.prompt_action("Server -> Client", s2c_data)
+                # Extract client ID from message
+                try:
+                    _, client_id, _, _, _ = parse_header(s2c_data)
+                    self.client_id = client_id
+                except:
+                    client_id = self.client_id or 0
                 
-                if result == "REFLECT":
-                    # Reflect back to server
-                    if not self.send_to_server(s2c_data):
-                        break
-                elif result is not None:
-                    if not self.send_to_client(result):
-                        break
-                # If None (dropped), just continue
+                # Enqueue for processing
+                pending = PendingMessage(
+                    direction="Server -> Client",
+                    client_id=client_id,
+                    data=s2c_data,
+                    handler=self
+                )
+                self.message_queue.put(pending)
         
         self.cleanup()
     
@@ -375,11 +325,128 @@ class MITMAttacker:
         self.socket: Optional[socket.socket] = None
         self.running = False
         self.message_store = MessageStore()
+        self.message_queue: queue.Queue = queue.Queue()  # Centralized queue
         self.handlers: List[ClientHandler] = []
     
     def log(self, msg: str):
         """Print log message."""
         print(f"[ATTACKER] {msg}")
+    
+    def prompt_action(self, pending: PendingMessage) -> None:
+        """
+        Prompt attacker for action on a message and execute it.
+        """
+        direction = pending.direction
+        data = pending.data
+        client_id = pending.client_id
+        handler = pending.handler
+        
+        summary = message_summary(data)
+        queue_size = self.message_queue.qsize()
+        
+        print(f"\n{'='*60}")
+        if queue_size > 0:
+            print(f"[INTERCEPTED] {direction} ({queue_size} more in queue)")
+        else:
+            print(f"[INTERCEPTED] {direction}")
+        print(f"{'='*60}")
+        print(f"    {summary}")
+        print(f"    Raw ({len(data)} bytes): {data[:32].hex()}...")
+        print()
+        print("    Actions:")
+        print("    [f] Forward unchanged")
+        print("    [d] Drop message")
+        print("    [m] Modify message")
+        print("    [r] Replay stored message")
+        print("    [e] Reflect back to sender")
+        print()
+        
+        while True:
+            action = input("    Action: ").strip().lower()
+            
+            if action == 'f':
+                print("    -> Forwarding")
+                self.message_store.add(direction, client_id, data)
+                self._send_message(pending, data)
+                return
+            
+            elif action == 'd':
+                print("    -> DROPPED")
+                self.message_store.add(direction, client_id, data)
+                # Don't send anything
+                return
+            
+            elif action == 'm':
+                modified = modify_message(data)
+                if modified != data:
+                    print("    -> Forwarding MODIFIED message")
+                else:
+                    print("    -> Forwarding unchanged")
+                self.message_store.add(direction, client_id, data)  # Store original
+                self._send_message(pending, modified)
+                return
+            
+            elif action == 'r':
+                self.message_store.list_messages()
+                try:
+                    idx = int(input("    Replay message #: ").strip())
+                    replay_data = self.message_store.get(idx)
+                    if replay_data:
+                        print(f"    -> REPLAYING message #{idx}")
+                        print(f"       {message_summary(replay_data)}")
+                        self.message_store.add(direction, client_id, data)  # Store original
+                        self._send_message(pending, replay_data)
+                        return
+                    else:
+                        print("    Invalid index")
+                except ValueError:
+                    print("    Invalid input")
+            
+            elif action == 'e':
+                print("    -> REFLECTING back to sender")
+                self.message_store.add(direction, client_id, data)
+                self._reflect_message(pending, data)
+                return
+            
+            else:
+                print("    Invalid action. Use: f/d/m/r/e")
+    
+    def _send_message(self, pending: PendingMessage, data: bytes) -> bool:
+        """Send message in the original direction."""
+        handler = pending.handler
+        
+        if pending.direction == "Client -> Server":
+            return handler.send_to_server(data)
+        else:
+            return handler.send_to_client(data)
+    
+    def _reflect_message(self, pending: PendingMessage, data: bytes) -> bool:
+        """Reflect message back to sender."""
+        handler = pending.handler
+        
+        if pending.direction == "Client -> Server":
+            # Was going to server, reflect back to client
+            return handler.send_to_client(data)
+        else:
+            # Was going to client, reflect back to server
+            return handler.send_to_server(data)
+    
+    def prompt_thread_func(self):
+        """Thread that processes messages from the queue one at a time."""
+        while self.running:
+            try:
+                # Wait for a message (with timeout so we can check self.running)
+                pending = self.message_queue.get(timeout=0.5)
+                
+                # Process this message (blocks until user responds)
+                self.prompt_action(pending)
+                
+                self.message_queue.task_done()
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                self.log(f"Prompt thread error: {e}")
     
     def start(self):
         """Start the MITM proxy."""
@@ -406,16 +473,22 @@ class MITMAttacker:
         print("Waiting for connections...")
         print("="*60)
         
+        # Start the prompt thread (single thread handles all prompts)
+        prompt_thread = threading.Thread(target=self.prompt_thread_func)
+        prompt_thread.daemon = True
+        prompt_thread.start()
+        
         while self.running:
             try:
                 self.socket.settimeout(1.0)
                 conn, addr = self.socket.accept()
-                self.log(f"New client connection from {addr}")
+                # self.log(f"New client connection from {addr}")
                 
                 handler = ClientHandler(
                     conn, addr,
                     self.config.server_host,
                     self.config.server_port,
+                    self.message_queue,  # Pass the centralized queue
                     self.message_store
                 )
                 self.handlers.append(handler)
