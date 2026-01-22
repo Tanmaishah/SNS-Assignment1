@@ -163,16 +163,19 @@ class SecureClient:
                 self.state.s2c_mac,
                 expected_round=0,
                 expected_direction=Direction.SERVER_TO_CLIENT,
+                expected_phase=Phase.INIT,
                 verbose=self.config.verbose
             )
         except ProtocolError as e:
             self.log(f"SERVER_CHALLENGE verification failed: {e}")
             return False
         
-        if opcode != Opcode.SERVER_CHALLENGE:
-            self.log(f"Expected SERVER_CHALLENGE, got {opcode.name}")
+        # TERMINATE is valid in INIT phase too
+        if opcode == Opcode.TERMINATE:
+            self.log(f"Server sent TERMINATE during handshake")
             return False
         
+        # At this point, opcode must be SERVER_CHALLENGE (already validated by parse_message)
         server_nonce, challenge = parse_server_challenge_payload(resp_payload)
         self.log(f"SERVER_CHALLENGE received: nonce={server_nonce.hex()[:16]}...")
         
@@ -248,6 +251,7 @@ class SecureClient:
                 self.state.s2c_mac,
                 expected_round=current_round,
                 expected_direction=Direction.SERVER_TO_CLIENT,
+                expected_phase=Phase.ACTIVE,
                 verbose=self.config.verbose
             )
         except ProtocolError as e:
@@ -255,16 +259,14 @@ class SecureClient:
             self.state.phase = Phase.TERMINATED
             return None
         
+        # TERMINATE is valid in ACTIVE phase
         if opcode == Opcode.TERMINATE:
             reason = parse_terminate_payload(resp_payload)
             self.log(f"Server TERMINATED session: {reason}")
             self.state.phase = Phase.TERMINATED
             return None
         
-        if opcode != Opcode.SERVER_AGGR_RESPONSE:
-            self.log(f"Expected SERVER_AGGR_RESPONSE, got {opcode.name}")
-            return None
-        
+        # At this point, opcode must be SERVER_AGGR_RESPONSE (already validated by parse_message)
         # Parse aggregate
         status, aggregate_str = parse_server_response_payload(resp_payload)
         self.log(f"Aggregate received: {aggregate_str} (status={status})")

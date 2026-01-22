@@ -53,6 +53,44 @@ class Phase(IntEnum):
     TERMINATED = 3
 
 
+# Valid opcodes for each phase and direction
+# Format: {Phase: {Direction: [valid_opcodes]}}
+VALID_OPCODES = {
+    Phase.INIT: {
+        Direction.CLIENT_TO_SERVER: [Opcode.CLIENT_HELLO, Opcode.TERMINATE],
+        Direction.SERVER_TO_CLIENT: [Opcode.SERVER_CHALLENGE, Opcode.TERMINATE],
+    },
+    Phase.ACTIVE: {
+        Direction.CLIENT_TO_SERVER: [Opcode.CLIENT_DATA, Opcode.TERMINATE],
+        Direction.SERVER_TO_CLIENT: [Opcode.SERVER_AGGR_RESPONSE, Opcode.TERMINATE],
+    },
+    Phase.TERMINATED: {
+        Direction.CLIENT_TO_SERVER: [],
+        Direction.SERVER_TO_CLIENT: [],
+    },
+}
+
+
+def validate_opcode(opcode: Opcode, phase: Phase, direction: Direction) -> bool:
+    """
+    Check if opcode is valid for current phase and direction.
+    
+    Returns True if valid, False otherwise.
+    """
+    if phase not in VALID_OPCODES:
+        return False
+    if direction not in VALID_OPCODES[phase]:
+        return False
+    return opcode in VALID_OPCODES[phase][direction]
+
+
+def get_valid_opcodes(phase: Phase, direction: Direction) -> list:
+    """Get list of valid opcodes for given phase and direction."""
+    if phase in VALID_OPCODES and direction in VALID_OPCODES[phase]:
+        return VALID_OPCODES[phase][direction]
+    return []
+
+
 # Header: Opcode(1) + ClientID(1) + Round(4) + Direction(1) + IV(16) = 23 bytes
 HEADER_SIZE = 1 + 1 + 4 + 1 + IV_SIZE  # 23 bytes
 
@@ -243,14 +281,24 @@ def parse_header(data: bytes) -> Tuple[Opcode, int, int, Direction, bytes]:
 
 def parse_message(data: bytes, enc_key: bytes, mac_key: bytes,
                   expected_round: int, expected_direction: Direction,
+                  expected_phase: Phase = None,
                   verbose: bool = False) -> Tuple[Opcode, int, bytes, bytes, bytes]:
     """
     Parse and decrypt a message.
     
-    Validates round number, direction, and HMAC before decryption.
+    Validates round number, direction, opcode (if phase provided), and HMAC before decryption.
+    
+    Args:
+        data: Raw message bytes
+        enc_key: Encryption key
+        mac_key: MAC key
+        expected_round: Expected round number
+        expected_direction: Expected message direction
+        expected_phase: If provided, validates opcode is valid for this phase
+        verbose: Enable verbose output
     
     Returns: (opcode, client_id, payload, ciphertext, nonce)
-    Raises: ProtocolError on any validation failure
+    Raises: ProtocolError on any validation failure (including HMAC/padding errors)
     """
     if len(data) < HEADER_SIZE + HMAC_SIZE:
         raise InvalidMessageError("Message too short")
@@ -269,6 +317,18 @@ def parse_message(data: bytes, enc_key: bytes, mac_key: bytes,
     if direction != expected_direction:
         raise DirectionError(f"Expected {expected_direction.name}, got {direction.name}")
     
+    # Validate opcode for phase (if phase provided)
+    if expected_phase is not None:
+        if not validate_opcode(opcode, expected_phase, direction):
+            valid_opcodes = get_valid_opcodes(expected_phase, direction)
+            valid_names = [op.name for op in valid_opcodes]
+            raise InvalidOpcodeError(
+                f"Opcode {opcode.name} not valid in {expected_phase.name} phase. "
+                f"Valid opcodes: {valid_names}"
+            )
+        if verbose:
+            print(f"[PARSE] Opcode {opcode.name} valid for {expected_phase.name} phase")
+    
     # Extract parts
     header = data[:HEADER_SIZE]
     hmac_tag = data[-HMAC_SIZE:]
@@ -278,6 +338,7 @@ def parse_message(data: bytes, enc_key: bytes, mac_key: bytes,
         raise InvalidMessageError("Empty ciphertext")
     
     # Verify HMAC and decrypt
+    # Catch crypto errors and convert to protocol errors for consistent handling
     try:
         payload = decrypt_message(enc_key, mac_key, iv, ciphertext, header, hmac_tag, verbose=verbose)
     except HMACVerificationError as e:

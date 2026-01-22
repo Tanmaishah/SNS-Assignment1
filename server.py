@@ -34,7 +34,8 @@ class ServerConfig:
     host: str = '127.0.0.1'
     port: int = 6000          # Server listens here (attacker connects to this)
     num_clients: int = 2      # Expected number of clients
-    round_timeout: float = 300  # Seconds to wait for all clients
+    round_timeout: float = 30.0  # Seconds to wait for all clients per round
+    handshake_timeout: float = 70.0  # Seconds to wait for all clients to handshake
     verbose: bool = True
 
 
@@ -133,13 +134,24 @@ class SecureServer:
         
         self.log(f"Server started on {self.config.host}:{self.config.port}")
         self.log(f"Expecting {self.config.num_clients} clients")
+        self.log(f"Handshake timeout: {self.config.handshake_timeout}s")
         self.log(f"Round timeout: {self.config.round_timeout}s")
         
-        # Wait for all clients to connect
-        self.log(f"\nWaiting for {self.config.num_clients} clients to connect...")
+        # Wait for clients to connect (with timeout)
+        self.log(f"\nWaiting for {self.config.num_clients} clients to connect (timeout: {self.config.handshake_timeout}s)...")
+        
+        handshake_start = time.time()
+        handshake_threads = []
         
         while len(self.sessions) < self.config.num_clients and self.running:
+            # Check if handshake timeout exceeded
+            elapsed = time.time() - handshake_start
+            if elapsed >= self.config.handshake_timeout:
+                self.log(f"\nHandshake timeout reached after {elapsed:.1f}s")
+                break
+            
             try:
+                # Short timeout to allow checking elapsed time
                 self.socket.settimeout(1.0)
                 conn, addr = self.socket.accept()
                 self.log(f"New connection from {addr}")
@@ -147,6 +159,7 @@ class SecureServer:
                 # Handle handshake in separate thread
                 thread = threading.Thread(target=self._handle_new_connection, args=(conn, addr))
                 thread.start()
+                handshake_threads.append(thread)
                 
             except socket.timeout:
                 continue
@@ -154,7 +167,17 @@ class SecureServer:
                 if self.running:
                     self.log(f"Accept error: {e}")
         
-        if len(self.sessions) == self.config.num_clients:
+        # Wait briefly for any pending handshake threads to complete
+        for thread in handshake_threads:
+            thread.join(timeout=2.0)
+        
+        # Check how many clients successfully connected
+        if len(self.sessions) == 0:
+            self.log("\nNo clients completed handshake. Shutting down.")
+        elif len(self.sessions) < self.config.num_clients:
+            self.log(f"\n{len(self.sessions)}/{self.config.num_clients} clients connected. Starting rounds with available clients.")
+            self._run_rounds()
+        else:
             self.log(f"\nAll {self.config.num_clients} clients connected!")
             self._run_rounds()
         
@@ -214,6 +237,7 @@ class SecureServer:
                     session.state.c2s_mac,
                     expected_round=0,
                     expected_direction=Direction.CLIENT_TO_SERVER,
+                    expected_phase=Phase.INIT,
                     verbose=self.config.verbose
                 )
             except ProtocolError as e:
@@ -366,20 +390,18 @@ class SecureServer:
                 session.state.c2s_mac,
                 expected_round=expected_round,
                 expected_direction=Direction.CLIENT_TO_SERVER,
+                expected_phase=Phase.ACTIVE,
                 verbose=self.config.verbose
             )
             
+            # TERMINATE is valid in ACTIVE phase, handle it
             if opcode == Opcode.TERMINATE:
                 self.log(f"Client {client_id} sent TERMINATE")
                 with self.lock:
                     self._terminate_client(client_id, "Client requested")
                 return
             
-            if opcode != Opcode.CLIENT_DATA:
-                self.log(f"Client {client_id}: Expected CLIENT_DATA, got {opcode.name}")
-                self._terminate_client(client_id, f"Invalid opcode: {opcode.name}")
-                return
-            
+            # At this point, opcode must be CLIENT_DATA (already validated by parse_message)
             # Parse data
             client_nonce, data_str = parse_client_data_payload(payload)
             try:
@@ -502,7 +524,8 @@ def main():
     parser.add_argument('--host', default='127.0.0.1', help='Server host')
     parser.add_argument('--port', type=int, default=6000, help='Server port')
     parser.add_argument('--clients', type=int, default=2, help='Number of expected clients')
-    parser.add_argument('--timeout', type=float, default=300.0, help='Round timeout in seconds')
+    parser.add_argument('--timeout', type=float, default=30.0, help='Round timeout in seconds')
+    parser.add_argument('--handshake-timeout', type=float, default=60.0, help='Handshake timeout in seconds')
     parser.add_argument('--quiet', action='store_true', help='Disable verbose output')
     args = parser.parse_args()
     
@@ -511,6 +534,7 @@ def main():
         port=args.port,
         num_clients=args.clients,
         round_timeout=args.timeout,
+        handshake_timeout=args.handshake_timeout,
         verbose=not args.quiet
     )
     
