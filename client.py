@@ -89,7 +89,7 @@ class SecureClient:
             self.log(f"Send error: {e}")
             return False
     
-    def recv(self, timeout: float = 300.0) -> Optional[bytes]:
+    def recv(self, timeout: float = 120.0) -> Optional[bytes]:
         """Receive data."""
         try:
             self.socket.settimeout(timeout)

@@ -278,7 +278,12 @@ def parse_message(data: bytes, enc_key: bytes, mac_key: bytes,
         raise InvalidMessageError("Empty ciphertext")
     
     # Verify HMAC and decrypt
-    payload = decrypt_message(enc_key, mac_key, iv, ciphertext, header, hmac_tag, verbose=verbose)
+    try:
+        payload = decrypt_message(enc_key, mac_key, iv, ciphertext, header, hmac_tag, verbose=verbose)
+    except HMACVerificationError as e:
+        raise InvalidMessageError(f"HMAC verification failed: {e}")
+    except PaddingError as e:
+        raise InvalidMessageError(f"Padding error (possible tampering): {e}")
     
     # Extract nonce (first 16 bytes of payload)
     nonce = payload[:16] if len(payload) >= 16 else payload
